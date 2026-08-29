@@ -6,6 +6,8 @@ import base64
 import requests
 import telebot
 
+from google import genai
+
 from telebot.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -14,13 +16,13 @@ from telebot.types import (
 )
 
 
-# =========================
-# CONFIG
-# =========================
+# ==================================================
+# CONFIGURATION
+# ==================================================
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 FREE_LIMIT = 15
@@ -34,51 +36,22 @@ bot = telebot.TeleBot(
 )
 
 
-# =========================
-# STATE
-# =========================
-
-busy_users = set()
-busy_lock = threading.Lock()
-
-last_request = {}
-
-image_waiting = set()
-
-
-# =========================
-# MODELS
-# =========================
-
-CHAT_MODELS = {
-    "DeepSeek": "deepseek/deepseek-chat",
-    "GPT-4o": "openai/gpt-4o",
-    "Claude": "anthropic/claude-3.5-sonnet",
-    "Grok": "x-ai/grok-beta"
-}
-
-IMAGE_MODEL = "google/gemini-3.1-flash-image-preview"
-
-
-# =========================
+# ==================================================
 # DATABASE
-# =========================
+# ==================================================
 
-def db():
-
+def get_db():
     conn = sqlite3.connect(
         DB_FILE,
         check_same_thread=False
     )
-
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
-def init_db():
+def init_database():
 
-    conn = db()
+    conn = get_db()
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -120,8 +93,7 @@ def init_db():
     conn.close()
 
 
-def today():
-
+def current_date():
     return time.strftime("%Y-%m-%d")
 
 
@@ -131,14 +103,14 @@ def get_user(
     username=""
 ):
 
-    conn = db()
+    conn = get_db()
 
-    row = conn.execute(
+    user = conn.execute(
         "SELECT * FROM users WHERE user_id=?",
         (user_id,)
     ).fetchone()
 
-    if not row:
+    if user is None:
 
         conn.execute("""
             INSERT INTO users
@@ -153,20 +125,20 @@ def get_user(
             VALUES (?, ?, ?, 0, ?, ?)
         """, (
             user_id,
-            first_name,
+            first_name or "",
             username or "",
-            today(),
+            current_date(),
             int(time.time())
         ))
 
         conn.commit()
 
-        row = conn.execute(
+        user = conn.execute(
             "SELECT * FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
 
-    elif row["free_date"] != today():
+    elif user["free_date"] != current_date():
 
         conn.execute("""
             UPDATE users
@@ -174,55 +146,53 @@ def get_user(
                 free_date=?
             WHERE user_id=?
         """, (
-            today(),
+            current_date(),
             user_id
         ))
 
         conn.commit()
 
-        row = conn.execute(
+        user = conn.execute(
             "SELECT * FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
 
     conn.close()
 
-    return row
+    return user
 
 
-# =========================
+# ==================================================
 # SUBSCRIPTION
-# =========================
+# ==================================================
 
 def subscription_active(user):
 
     return (
-        user["subscription_until"] is not None
+        user["subscription_until"]
         and
         user["subscription_until"] > int(time.time())
     )
 
 
-def get_price(user):
+def get_subscription_price(user):
 
     if (
         user["referrals"] >= 50
         and
         user["paid_referrals"] >= 10
     ):
-
         return 50
 
     if user["referrals"] >= 30:
-
         return 70
 
     return 100
 
 
-# =========================
-# KEYBOARD
-# =========================
+# ==================================================
+# MAIN KEYBOARD
+# ==================================================
 
 def main_keyboard():
 
@@ -257,9 +227,9 @@ def main_keyboard():
     return markup
 
 
-# =========================
-# CONVERSATION MEMORY
-# =========================
+# ==================================================
+# CHAT MEMORY
+# ==================================================
 
 def save_message(
     user_id,
@@ -267,7 +237,7 @@ def save_message(
     content
 ):
 
-    conn = db()
+    conn = get_db()
 
     conn.execute("""
         INSERT INTO messages
@@ -291,7 +261,7 @@ def save_message(
 
 def get_history(user_id):
 
-    conn = db()
+    conn = get_db()
 
     rows = conn.execute("""
         SELECT role, content
@@ -316,66 +286,16 @@ def get_history(user_id):
     ]
 
 
-# =========================
-# TYPING
-# =========================
-
-def typing_loop(
-    chat_id,
-    stop_event
-):
-
-    while not stop_event.is_set():
-
-        try:
-
-            bot.send_chat_action(
-                chat_id,
-                "typing"
-            )
-
-        except Exception:
-
-            pass
-
-        stop_event.wait(4)
-
-
-# =========================
-# LONG MESSAGE
-# =========================
-
-def send_long_message(
-    chat_id,
-    text
-):
-
-    if not text:
-
-        text = (
-            "Sorry, I could not generate a response."
-        )
-
-    for i in range(
-        0,
-        len(text),
-        4000
-    ):
-
-        bot.send_message(
-            chat_id,
-            text[i:i + 4000]
-        )
-
-
-# =========================
-# SYSTEM PROMPT
-# =========================
+# ==================================================
+# SYSTEM INSTRUCTION
+# ==================================================
 
 def system_prompt():
 
     return """
 You are BOSSAI, a natural all-in-one AI assistant.
+
+Speak naturally.
 
 Default language is English.
 
@@ -385,63 +305,98 @@ respond naturally in Amharic.
 If the user speaks another language,
 respond naturally in that language.
 
-Do not unnecessarily mention that you are a bot.
+Do not unnecessarily say that you are a bot.
 
 Do not use hashtag symbols.
 
 Be helpful, clear and natural.
 
 Remember relevant conversation context.
+
+If the user sends a follow-up question,
+understand the previous conversation.
 """
 
 
-# =========================
+# ==================================================
 # OPENROUTER CHAT
-# =========================
+# ==================================================
+
+CHAT_MODELS = {
+
+    "DeepSeek":
+        "deepseek/deepseek-chat",
+
+    "GPT-4o":
+        "openai/gpt-4o",
+
+    "Claude":
+        "anthropic/claude-3.5-sonnet",
+
+    "Grok":
+        "x-ai/grok-beta"
+}
+
 
 def ask_openrouter(
     user_id,
     text
 ):
 
+    if not OPENROUTER_API_KEY:
+
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is missing."
+        )
+
     user = get_user(user_id)
 
-    model_name = user["model"]
+    model = user["model"]
 
     history = get_history(
         user_id
     )
 
     messages = [
+
         {
             "role": "system",
             "content": system_prompt()
         }
+
     ]
 
     messages.extend(history)
 
     messages.append({
+
         "role": "user",
         "content": text
+
     })
 
     response = requests.post(
+
         "https://openrouter.ai/api/v1/chat/completions",
 
         headers={
+
             "Authorization":
                 f"Bearer {OPENROUTER_API_KEY}",
+
             "Content-Type":
                 "application/json"
+
         },
 
         json={
+
             "model":
-                CHAT_MODELS[model_name],
+                CHAT_MODELS[model],
 
             "messages":
                 messages
+
         },
 
         timeout=90
@@ -450,8 +405,7 @@ def ask_openrouter(
     if not response.ok:
 
         raise RuntimeError(
-            f"OpenRouter error: "
-            f"{response.status_code} "
+            f"OpenRouter {response.status_code}: "
             f"{response.text}"
         )
 
@@ -463,9 +417,9 @@ def ask_openrouter(
     )
 
 
-# =========================
-# GEMINI FALLBACK
-# =========================
+# ==================================================
+# GEMINI CHAT
+# ==================================================
 
 def ask_gemini(
     user_id,
@@ -475,7 +429,7 @@ def ask_gemini(
     if not GEMINI_API_KEY:
 
         raise RuntimeError(
-            "Gemini API key is missing."
+            "GEMINI_API_KEY is missing."
         )
 
     history = get_history(
@@ -500,58 +454,35 @@ Previous conversation:
 
 {conversation}
 
-User:
+Current user message:
 
 {text}
 """
 
-    response = requests.post(
-
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
-
-        params={
-            "key": GEMINI_API_KEY
-        },
-
-        headers={
-            "Content-Type":
-                "application/json"
-        },
-
-        json={
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": prompt
-                        }
-                    ]
-                }
-            ]
-        },
-
-        timeout=90
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
     )
 
-    if not response.ok:
+    response = client.models.generate_content(
+
+        model="gemini-3.7-flash",
+
+        contents=prompt
+
+    )
+
+    if not response.text:
 
         raise RuntimeError(
-            f"Gemini error: "
-            f"{response.status_code} "
-            f"{response.text}"
+            "Gemini returned an empty response."
         )
 
-    data = response.json()
-
-    return (
-        data["candidates"][0]
-        ["content"]["parts"][0]["text"]
-    )
+    return response.text
 
 
-# =========================
-# AI
-# =========================
+# ==================================================
+# AI ROUTER
+# ==================================================
 
 def ask_ai(
     user_id,
@@ -560,25 +491,25 @@ def ask_ai(
 
     user = get_user(user_id)
 
+    if user["model"] == "Gemini":
+
+        return ask_gemini(
+            user_id,
+            text
+        )
+
     try:
-
-        if user["model"] == "Gemini":
-
-            return ask_gemini(
-                user_id,
-                text
-            )
 
         return ask_openrouter(
             user_id,
             text
         )
 
-    except Exception as error:
+    except Exception as openrouter_error:
 
         print(
-            "OpenRouter error:",
-            error
+            "OpenRouter failed:",
+            openrouter_error
         )
 
         if GEMINI_API_KEY:
@@ -591,123 +522,115 @@ def ask_ai(
         raise
 
 
-# =========================
-# IMAGE GENERATION
-# =========================
+# ==================================================
+# TYPING INDICATOR
+# ==================================================
 
-def generate_image(
-    prompt
+def typing_loop(
+    chat_id,
+    stop_event
 ):
 
-    response = requests.post(
+    while not stop_event.is_set():
 
-        "https://openrouter.ai/api/v1/images",
+        try:
 
-        headers={
-            "Authorization":
-                f"Bearer {OPENROUTER_API_KEY}",
+            bot.send_chat_action(
+                chat_id,
+                "typing"
+            )
 
-            "Content-Type":
-                "application/json"
-        },
+        except Exception:
 
-        json={
-            "model":
-                IMAGE_MODEL,
+            pass
 
-            "prompt":
-                prompt,
+        stop_event.wait(4)
 
-            "n":
-                1
-        },
 
-        timeout=180
-    )
+# ==================================================
+# SEND LONG MESSAGE
+# ==================================================
 
-    if not response.ok:
+def send_long_message(
+    chat_id,
+    text
+):
 
-        raise RuntimeError(
-            f"Image API error: "
-            f"{response.status_code} "
-            f"{response.text}"
+    if not text:
+
+        text = (
+            "Sorry, I could not generate "
+            "a response."
         )
 
-    data = response.json()
+    for i in range(
+        0,
+        len(text),
+        4000
+    ):
 
-    if "data" not in data:
-
-        raise RuntimeError(
-            f"No image returned: {data}"
+        bot.send_message(
+            chat_id,
+            text[i:i + 4000]
         )
 
-    image_item = data["data"][0]
 
-    encoded = image_item.get(
-        "b64_json"
-    )
-
-    if not encoded:
-
-        raise RuntimeError(
-            "Image response did not contain b64_json."
-        )
-
-    return base64.b64decode(
-        encoded
-    )
-
-
-# =========================
+# ==================================================
 # START
-# =========================
+# ==================================================
 
 @bot.message_handler(
     commands=["start"]
 )
 def start(message):
 
-    get_user(
+    user = get_user(
+
         message.from_user.id,
+
         message.from_user.first_name,
+
         message.from_user.username
+
     )
 
     name = (
         message.from_user.first_name
-        or "there"
+        or
+        "there"
     )
 
-    text = f"""
+    bot.send_message(
+
+        message.chat.id,
+
+        f"""
 Hello {name}! Welcome to BOSSAI — your all-in-one AI assistant.
 
 Access GPT-4o, Claude, DeepSeek, Grok, and Gemini in one bot.
 
 I can:
-• Answer any question
+• Answer questions
 • Write and translate text
 • Write and debug code
 • Solve math problems
-• Analyze supported content
-• Remember our conversation
+• Remember conversations
 • Generate images
 
 Free: 15 messages per day
 Unlimited: 100 ETB/month
 
-Use the buttons below to continue.
-"""
+Use the buttons below.
+""",
 
-    bot.send_message(
-        message.chat.id,
-        text,
         reply_markup=main_keyboard()
+
     )
 
 
-# =========================
+# ==================================================
 # HELP
-# =========================
+# ==================================================
 
 @bot.message_handler(
     commands=["help"]
@@ -715,7 +638,9 @@ Use the buttons below to continue.
 def help_command(message):
 
     bot.send_message(
+
         message.chat.id,
+
         """
 BOSSAI Help
 
@@ -728,30 +653,31 @@ Free
 Unlimited
 100 ETB/month.
 
-Payment
-Open Payment Methods.
+Payment Methods
+Choose Telebirr, Payoneer or PayPal.
 
 Referral
-Open Referral.
+Invite users and receive discounts.
 
 Models
-Choose an AI model.
+Choose your AI model.
 
 Restart
-Start a fresh conversation.
+Clear your current conversation.
 
-Image
-Create an image from a text prompt.
+Create Image
+Generate an image from a description.
 
-Video
-Video generation can be connected to a supported video API.
+Create Video
+Video generation can be connected later.
 
-Music
-Music generation can be connected to a supported music API.
+Create Music
+Music generation can be connected later.
 
 Support
 @Silent_Survivorr
 """
+
     )
 
 
@@ -764,14 +690,73 @@ def help_button(message):
     help_command(message)
 
 
-# =========================
-# PAYMENT
-# =========================
+# ==================================================
+# PAYMENT MENU
+# ==================================================
+
+def show_payment_menu(message):
+
+    user = get_user(
+        message.from_user.id
+    )
+
+    price = get_subscription_price(
+        user
+    )
+
+    markup = InlineKeyboardMarkup()
+
+    markup.add(
+
+        InlineKeyboardButton(
+
+            f"💳 Telebirr — {price} ETB/month",
+
+            callback_data="telebirr"
+
+        )
+
+    )
+
+    markup.add(
+
+        InlineKeyboardButton(
+
+            "🌍 Payoneer",
+
+            callback_data="payoneer"
+
+        )
+
+    )
+
+    markup.add(
+
+        InlineKeyboardButton(
+
+            "🅿️ PayPal",
+
+            callback_data="paypal"
+
+        )
+
+    )
+
+    bot.send_message(
+
+        message.chat.id,
+
+        "Choose your payment method:",
+
+        reply_markup=markup
+
+    )
+
 
 @bot.message_handler(
     commands=["menu"]
 )
-def payment_menu(message):
+def menu_command(message):
 
     show_payment_menu(
         message
@@ -789,49 +774,14 @@ def payment_button(message):
     )
 
 
-def show_payment_menu(message):
-
-    user = get_user(
-        message.from_user.id
-    )
-
-    price = get_price(
-        user
-    )
-
-    markup = InlineKeyboardMarkup()
-
-    markup.add(
-        InlineKeyboardButton(
-            f"💳 Telebirr — {price} ETB/month",
-            callback_data="telebirr"
-        )
-    )
-
-    markup.add(
-        InlineKeyboardButton(
-            "🌍 Payoneer",
-            callback_data="payoneer"
-        )
-    )
-
-    markup.add(
-        InlineKeyboardButton(
-            "🅿️ PayPal",
-            callback_data="paypal"
-        )
-    )
-
-    bot.send_message(
-        message.chat.id,
-        "Choose your payment method:",
-        reply_markup=markup
-    )
-
+# ==================================================
+# PAYMENT CALLBACK
+# ==================================================
 
 @bot.callback_query_handler(
     func=lambda call:
-    call.data in [
+    call.data in
+    [
         "telebirr",
         "payoneer",
         "paypal"
@@ -849,12 +799,14 @@ def payment_callback(call):
             call.from_user.id
         )
 
-        price = get_price(
+        price = get_subscription_price(
             user
         )
 
         bot.send_message(
+
             call.message.chat.id,
+
             f"""
 Telebirr Payment
 
@@ -864,36 +816,43 @@ Amount:
 Receiver:
 Hussen
 
-Telebirr number:
+Telebirr:
 0964990206
 
 Telegram:
 @Silent_Survivorr
 
-After payment, send your payment receipt screenshot directly here.
+After payment, send your payment receipt screenshot here.
 
-After verification, your monthly unlimited access will be activated.
+Your subscription will be activated after manual verification.
 """
+
         )
 
     elif call.data == "payoneer":
 
         bot.send_message(
+
             call.message.chat.id,
+
             "Payoneer: Soon Available."
+
         )
 
     elif call.data == "paypal":
 
         bot.send_message(
+
             call.message.chat.id,
+
             "PayPal: Soon Available."
+
         )
 
 
-# =========================
+# ==================================================
 # PAYMENT RECEIPT
-# =========================
+# ==================================================
 
 @bot.message_handler(
     content_types=["photo"]
@@ -903,25 +862,34 @@ def payment_receipt(message):
     if ADMIN_ID == 0:
 
         bot.reply_to(
+
             message,
-            "Receipt received, but admin verification is not configured."
+
+            "Receipt received. Admin verification is not configured yet."
+
         )
 
         return
 
     user = get_user(
+
         message.from_user.id,
+
         message.from_user.first_name,
+
         message.from_user.username
+
     )
 
-    price = get_price(
+    price = get_subscription_price(
         user
     )
 
-    conn = db()
+    conn = get_db()
 
-    cursor = conn.execute("""
+    cursor = conn.execute(
+
+        """
         INSERT INTO payments
         (
             user_id,
@@ -930,11 +898,15 @@ def payment_receipt(message):
             created_at
         )
         VALUES (?, ?, 'pending', ?)
-    """, (
-        message.from_user.id,
-        price,
-        int(time.time())
-    ))
+        """,
+
+        (
+            message.from_user.id,
+            price,
+            int(time.time())
+        )
+
+    )
 
     payment_id = cursor.lastrowid
 
@@ -946,16 +918,23 @@ def payment_receipt(message):
     markup.add(
 
         InlineKeyboardButton(
+
             "✅ Approve",
+
             callback_data=
             f"approve:{payment_id}:{message.from_user.id}"
+
         ),
 
         InlineKeyboardButton(
+
             "❌ Reject",
+
             callback_data=
             f"reject:{payment_id}:{message.from_user.id}"
+
         )
+
     )
 
     caption = f"""
@@ -981,21 +960,29 @@ Pending
 """
 
     bot.send_photo(
+
         ADMIN_ID,
+
         message.photo[-1].file_id,
+
         caption=caption,
+
         reply_markup=markup
+
     )
 
     bot.reply_to(
+
         message,
+
         "Your receipt has been sent for verification. Please wait for approval."
+
     )
 
 
-# =========================
-# APPROVE / REJECT
-# =========================
+# ==================================================
+# APPROVE / REJECT PAYMENT
+# ==================================================
 
 @bot.callback_query_handler(
     func=lambda call:
@@ -1008,9 +995,13 @@ def payment_decision(call):
     if call.from_user.id != ADMIN_ID:
 
         bot.answer_callback_query(
+
             call.id,
+
             "Not authorized.",
+
             show_alert=True
+
         )
 
         return
@@ -1034,65 +1025,88 @@ def payment_decision(call):
     if action == "approve":
 
         until = (
+
             int(time.time())
             +
             30 * 24 * 60 * 60
+
         )
 
-        conn = db()
+        conn = get_db()
 
-        conn.execute("""
+        conn.execute(
+
+            """
             UPDATE payments
             SET status='approved'
             WHERE id=?
-        """, (
-            payment_id,
-        ))
+            """,
 
-        conn.execute("""
+            (payment_id,)
+
+        )
+
+        conn.execute(
+
+            """
             UPDATE users
             SET subscription_until=?
             WHERE user_id=?
-        """, (
-            until,
-            user_id
-        ))
+            """,
 
-        referrer = conn.execute(
+            (
+                until,
+                user_id
+            )
+
+        )
+
+        referral = conn.execute(
+
             """
             SELECT referred_by
             FROM users
             WHERE user_id=?
             """,
+
             (user_id,)
+
         ).fetchone()
 
-        if (
-            referrer
-            and
-            referrer["referred_by"]
-        ):
+        if referral and referral["referred_by"]:
 
-            conn.execute("""
+            conn.execute(
+
+                """
                 UPDATE users
                 SET paid_referrals =
                     paid_referrals + 1
                 WHERE user_id=?
-            """, (
-                referrer["referred_by"],
-            ))
+                """,
+
+                (
+                    referral["referred_by"],
+                )
+
+            )
 
         conn.commit()
         conn.close()
 
         bot.edit_message_reply_markup(
+
             call.message.chat.id,
+
             call.message.message_id,
+
             reply_markup=None
+
         )
 
         bot.send_message(
+
             user_id,
+
             """
 Payment approved.
 
@@ -1100,45 +1114,57 @@ Your unlimited subscription is active for 30 days.
 
 Thank you for using BOSSAI.
 """
+
         )
 
     else:
 
-        conn = db()
+        conn = get_db()
 
-        conn.execute("""
+        conn.execute(
+
+            """
             UPDATE payments
             SET status='rejected'
             WHERE id=?
-        """, (
-            payment_id,
-        ))
+            """,
+
+            (payment_id,)
+
+        )
 
         conn.commit()
         conn.close()
 
         bot.edit_message_reply_markup(
+
             call.message.chat.id,
+
             call.message.message_id,
+
             reply_markup=None
+
         )
 
         bot.send_message(
-            user_id,
-            """
-Your payment receipt was not approved.
 
-Please check the payment and send a valid receipt again.
+            user_id,
+
+            """
+Your payment receipt was rejected.
+
+Please send a valid receipt again.
 
 Support:
 @Silent_Survivorr
 """
+
         )
 
 
-# =========================
+# ==================================================
 # REFERRAL
-# =========================
+# ==================================================
 
 @bot.message_handler(
     func=lambda m:
@@ -1147,30 +1173,36 @@ Support:
 def referral(message):
 
     user = get_user(
-        message.from_user.id,
-        message.from_user.first_name,
-        message.from_user.username
+        message.from_user.id
     )
 
-    username = bot.get_me().username
-
-    link = (
-        f"https://t.me/{username}"
-        f"?start=ref_{message.from_user.id}"
+    bot_username = (
+        bot.get_me().username
     )
 
-    price = get_price(
+    referral_link = (
+
+        f"https://t.me/"
+        f"{bot_username}"
+        f"?start=ref_"
+        f"{message.from_user.id}"
+
+    )
+
+    price = get_subscription_price(
         user
     )
 
     bot.send_message(
+
         message.chat.id,
+
         f"""
 Referral Program
 
 Your referral link:
 
-{link}
+{referral_link}
 
 30 referrals
 → 70 ETB/month
@@ -1184,15 +1216,16 @@ Your referrals:
 Paid referrals:
 {user["paid_referrals"]}
 
-Current monthly price:
-{price} ETB
+Current price:
+{price} ETB/month
 """
+
     )
 
 
-# =========================
+# ==================================================
 # MODELS
-# =========================
+# ==================================================
 
 @bot.message_handler(
     func=lambda m:
@@ -1202,21 +1235,32 @@ def models(message):
 
     markup = InlineKeyboardMarkup()
 
-    for name in CHAT_MODELS:
+    for model in CHAT_MODELS:
 
         markup.add(
+
             InlineKeyboardButton(
-                name,
+
+                model,
+
                 callback_data=
-                f"model:{name}"
+                f"model:{model}"
+
             )
+
         )
 
     markup.add(
+
         InlineKeyboardButton(
+
             "Gemini",
-            callback_data="model:Gemini"
+
+            callback_data=
+            "model:Gemini"
+
         )
+
     )
 
     user = get_user(
@@ -1224,14 +1268,18 @@ def models(message):
     )
 
     bot.send_message(
+
         message.chat.id,
+
         f"""
 Current model:
 {user["model"]}
 
 Choose a model:
 """,
+
         reply_markup=markup
+
     )
 
 
@@ -1258,29 +1306,38 @@ def model_callback(call):
 
         return
 
-    conn = db()
+    conn = get_db()
 
-    conn.execute("""
+    conn.execute(
+
+        """
         UPDATE users
         SET model=?
         WHERE user_id=?
-    """, (
-        model,
-        call.from_user.id
-    ))
+        """,
+
+        (
+            model,
+            call.from_user.id
+        )
+
+    )
 
     conn.commit()
     conn.close()
 
     bot.send_message(
+
         call.message.chat.id,
+
         f"Model changed to {model}."
+
     )
 
 
-# =========================
+# ==================================================
 # ACCOUNT
-# =========================
+# ==================================================
 
 @bot.message_handler(
     func=lambda m:
@@ -1293,16 +1350,22 @@ def account(message):
     )
 
     remaining = max(
+
         0,
+
         FREE_LIMIT -
         user["free_used"]
+
     )
 
     if subscription_active(user):
 
         days = max(
+
             1,
+
             int(
+
                 (
                     user["subscription_until"]
                     -
@@ -1310,45 +1373,51 @@ def account(message):
                 )
                 /
                 86400
+
             )
+
         )
 
-        status = (
+        plan = (
             "Unlimited active\n"
             f"Approximately {days} days remaining"
         )
 
     else:
 
-        status = "Free plan"
+        plan = "Free plan"
 
-    conn = db()
+    conn = get_db()
 
     total_users = conn.execute(
-        "SELECT COUNT(*) AS c FROM users"
-    ).fetchone()["c"]
+
+        "SELECT COUNT(*) AS count FROM users"
+
+    ).fetchone()["count"]
 
     paid_users = conn.execute(
+
         """
-        SELECT COUNT(*) AS c
+        SELECT COUNT(*) AS count
         FROM users
         WHERE subscription_until > ?
         """,
+
         (int(time.time()),)
-    ).fetchone()["c"]
+
+    ).fetchone()["count"]
 
     conn.close()
 
     bot.send_message(
+
         message.chat.id,
+
         f"""
 My Account
 
-User ID:
-{message.from_user.id}
-
 Plan:
-{status}
+{plan}
 
 Free messages remaining today:
 {remaining}
@@ -1368,12 +1437,13 @@ Registered users:
 Active paid users:
 {paid_users}
 """
+
     )
 
 
-# =========================
+# ==================================================
 # RESTART
-# =========================
+# ==================================================
 
 @bot.message_handler(
     func=lambda m:
@@ -1381,28 +1451,112 @@ Active paid users:
 )
 def restart(message):
 
-    conn = db()
+    conn = get_db()
 
-    conn.execute("""
+    conn.execute(
+
+        """
         DELETE FROM messages
         WHERE user_id=?
-    """, (
-        message.from_user.id,
-    ))
+        """,
+
+        (
+            message.from_user.id,
+        )
+
+    )
 
     conn.commit()
     conn.close()
 
     bot.send_message(
+
         message.chat.id,
+
         "Conversation restarted. You can start a new chat.",
+
         reply_markup=main_keyboard()
+
     )
 
 
-# =========================
-# IMAGE BUTTON
-# =========================
+# ==================================================
+# IMAGE GENERATION
+# ==================================================
+
+IMAGE_MODEL = (
+    "google/gemini-3.1-flash-image-preview"
+)
+
+
+def generate_image(prompt):
+
+    if not OPENROUTER_API_KEY:
+
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is missing."
+        )
+
+    response = requests.post(
+
+        "https://openrouter.ai/api/v1/images",
+
+        headers={
+
+            "Authorization":
+                f"Bearer {OPENROUTER_API_KEY}",
+
+            "Content-Type":
+                "application/json"
+
+        },
+
+        json={
+
+            "model":
+                IMAGE_MODEL,
+
+            "prompt":
+                prompt,
+
+            "n":
+                1
+
+        },
+
+        timeout=180
+
+    )
+
+    if not response.ok:
+
+        raise RuntimeError(
+
+            f"Image API {response.status_code}: "
+            f"{response.text}"
+
+        )
+
+    data = response.json()
+
+    image_data = (
+        data["data"][0]
+        .get("b64_json")
+    )
+
+    if not image_data:
+
+        raise RuntimeError(
+            "No image data returned."
+        )
+
+    return base64.b64decode(
+        image_data
+    )
+
+
+image_waiting = set()
+
 
 @bot.message_handler(
     func=lambda m:
@@ -1415,26 +1569,23 @@ def image_button(message):
     )
 
     bot.send_message(
-        message.chat.id,
-        """
-🎨 Create Image
 
-Send a description of the image you want.
+        message.chat.id,
+
+        """
+Create Image
+
+Send me a description of the image you want.
 
 Example:
 
-A cinematic futuristic city at night, realistic lighting, detailed buildings, dramatic sky.
+A futuristic city at night, cinematic lighting, realistic, highly detailed.
 """
+
     )
 
 
-# =========================
-# IMAGE GENERATION MESSAGE
-# =========================
-
-def handle_image_prompt(
-    message
-):
+def process_image_prompt(message):
 
     user_id = message.from_user.id
 
@@ -1449,21 +1600,31 @@ def handle_image_prompt(
     if not prompt:
 
         bot.send_message(
+
             message.chat.id,
+
             "Please describe the image you want."
+
         )
 
         return
 
-    stop_typing = threading.Event()
+    stop_event = threading.Event()
 
     thread = threading.Thread(
+
         target=typing_loop,
+
         args=(
+
             message.chat.id,
-            stop_typing
+
+            stop_event
+
         ),
+
         daemon=True
+
     )
 
     thread.start()
@@ -1471,18 +1632,26 @@ def handle_image_prompt(
     try:
 
         bot.send_message(
+
             message.chat.id,
+
             "🎨 Creating your image..."
+
         )
 
-        image_bytes = generate_image(
+        image = generate_image(
             prompt
         )
 
         bot.send_photo(
+
             message.chat.id,
-            image_bytes,
-            caption="Generated by BOSSAI"
+
+            image,
+
+            caption=
+            "Generated by BOSSAI"
+
         )
 
     except Exception as error:
@@ -1493,18 +1662,21 @@ def handle_image_prompt(
         )
 
         bot.send_message(
+
             message.chat.id,
-            "Sorry, I could not generate the image right now. Please try again."
+
+            "Sorry, image generation is unavailable right now."
+
         )
 
     finally:
 
-        stop_typing.set()
+        stop_event.set()
 
 
-# =========================
+# ==================================================
 # VIDEO
-# =========================
+# ==================================================
 
 @bot.message_handler(
     func=lambda m:
@@ -1513,20 +1685,23 @@ def handle_image_prompt(
 def video_button(message):
 
     bot.send_message(
+
         message.chat.id,
+
         """
-🎬 Video Generation
+🎬 Create Video
 
-The Video button is ready in the menu.
+The video menu is ready.
 
-A video-generation API still needs to be connected before BOSSAI can generate the actual video.
+A dedicated video-generation API still needs to be connected before BOSSAI can generate videos.
 """
+
     )
 
 
-# =========================
+# ==================================================
 # MUSIC
-# =========================
+# ==================================================
 
 @bot.message_handler(
     func=lambda m:
@@ -1535,20 +1710,23 @@ A video-generation API still needs to be connected before BOSSAI can generate th
 def music_button(message):
 
     bot.send_message(
+
         message.chat.id,
+
         """
-🎵 Music Generation
+🎵 Create Music
 
-The Music button is ready in the menu.
+The music menu is ready.
 
-A music-generation API still needs to be connected before BOSSAI can generate actual music.
+A dedicated music-generation API still needs to be connected before BOSSAI can generate music.
 """
+
     )
 
 
-# =========================
-# DOCUMENT / VOICE
-# =========================
+# ==================================================
+# FILES
+# ==================================================
 
 @bot.message_handler(
     content_types=[
@@ -1557,28 +1735,39 @@ A music-generation API still needs to be connected before BOSSAI can generate ac
         "audio"
     ]
 )
-def media_message(message):
+def file_handler(message):
 
     bot.reply_to(
-        message,
-        """
-I received your file/audio.
 
-Document and voice processing needs the corresponding transcription/document API to be connected.
+        message,
+
+        """
+I received your file.
+
+File and voice analysis can be connected to the appropriate processing service.
 """
+
     )
 
 
-# =========================
+# ==================================================
 # MAIN CHAT
-# =========================
+# ==================================================
+
+busy_users = set()
+busy_lock = threading.Lock()
+
+last_request = {}
+
 
 @bot.message_handler(
     content_types=["text"]
 )
 def chat(message):
 
-    text = message.text.strip()
+    text = (
+        message.text.strip()
+    )
 
     if not text:
 
@@ -1588,18 +1777,20 @@ def chat(message):
 
         return
 
-    user_id = message.from_user.id
+    user_id = (
+        message.from_user.id
+    )
 
-    # Image prompt mode
+    # Image prompt
     if user_id in image_waiting:
 
-        handle_image_prompt(
+        process_image_prompt(
             message
         )
 
         return
 
-    # 2 second protection
+    # Two-second protection
     now = time.time()
 
     previous = last_request.get(
@@ -1613,8 +1804,11 @@ def chat(message):
     ):
 
         bot.reply_to(
+
             message,
+
             "⏳ Wait another 2 seconds before submitting your next question . . ."
+
         )
 
         return
@@ -1622,21 +1816,24 @@ def chat(message):
     last_request[user_id] = now
 
     user = get_user(
+
         user_id,
+
         message.from_user.first_name,
+
         message.from_user.username
+
     )
 
     # Free limit
     if not subscription_active(user):
 
-        if (
-            user["free_used"]
-            >= FREE_LIMIT
-        ):
+        if user["free_used"] >= FREE_LIMIT:
 
             bot.reply_to(
+
                 message,
+
                 """
 You have used all 15 free messages for today.
 
@@ -1644,31 +1841,39 @@ Unlimited access is 100 ETB/month.
 
 Open Payment Methods to continue.
 """
+
             )
 
             return
 
-        conn = db()
+        conn = get_db()
 
-        conn.execute("""
+        conn.execute(
+
+            """
             UPDATE users
             SET free_used=free_used+1
             WHERE user_id=?
-        """, (
-            user_id,
-        ))
+            """,
+
+            (user_id,)
+
+        )
 
         conn.commit()
         conn.close()
 
-    # Prevent simultaneous questions
+    # Busy protection
     with busy_lock:
 
         if user_id in busy_users:
 
             bot.reply_to(
+
                 message,
+
                 "⏳ Wait another 2 seconds before submitting your next question . . ."
+
             )
 
             return
@@ -1677,15 +1882,22 @@ Open Payment Methods to continue.
             user_id
         )
 
-    stop_typing = threading.Event()
+    stop_event = threading.Event()
 
     typing_thread = threading.Thread(
+
         target=typing_loop,
+
         args=(
+
             message.chat.id,
-            stop_typing
+
+            stop_event
+
         ),
+
         daemon=True
+
     )
 
     typing_thread.start()
@@ -1693,25 +1905,39 @@ Open Payment Methods to continue.
     try:
 
         save_message(
+
             user_id,
+
             "user",
+
             text
+
         )
 
         answer = ask_ai(
+
             user_id,
+
             text
+
         )
 
         save_message(
+
             user_id,
+
             "assistant",
+
             answer
+
         )
 
         send_long_message(
+
             message.chat.id,
+
             answer
+
         )
 
     except Exception as error:
@@ -1722,13 +1948,16 @@ Open Payment Methods to continue.
         )
 
         bot.reply_to(
+
             message,
+
             "Sorry, I could not connect to the AI service right now. Please try again."
+
         )
 
     finally:
 
-        stop_typing.set()
+        stop_event.set()
 
         with busy_lock:
 
@@ -1737,13 +1966,13 @@ Open Payment Methods to continue.
             )
 
 
-# =========================
-# RUN
-# =========================
+# ==================================================
+# RUN BOT
+# ==================================================
 
 def main():
 
-    init_db()
+    init_database()
 
     print(
         "BOSSAI is running..."
@@ -1754,9 +1983,13 @@ def main():
         try:
 
             bot.infinity_polling(
+
                 skip_pending=True,
+
                 timeout=30,
+
                 long_polling_timeout=30
+
             )
 
         except Exception as error:
